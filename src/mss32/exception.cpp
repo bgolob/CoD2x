@@ -9,7 +9,7 @@
 #include <time.h>
 
 #include "shared.h"
-#include "window.h"
+#include "gamma.h"
 #include "error.h"
 #include "main.h"
 #include "console.h"
