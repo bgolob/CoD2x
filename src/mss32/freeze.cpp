@@ -89,16 +89,16 @@ void sub_004624a0()
 
     // CoD2x:
     // Wait for the third event, but with finite timeout
-    DWORD wait = WaitForSingleObject(data_d528ec, 5000);
+    DWORD wait = WaitForSingleObject(data_d528ec, 1000);
 
     if (wait == WAIT_OBJECT_0)
         return;
 
     if (wait == WAIT_TIMEOUT) {
-        showErrorMessage("Error", "Call of Duty 2 has frozen.\n\nThe main thread did not respond within 5 seconds\n\nCoD2x will try to restart the game.");
+        //showErrorMessage("Error", "Call of Duty 2 has frozen.\n\nThe main thread did not respond within 5 seconds\n\nCoD2x will try to restart the game.");
 
         // call 0040d780    char* vid_restart_cmd()
-        ASM_CALL(RETURN_VOID, 0x0040d780, 0);
+        //ASM_CALL(RETURN_VOID, 0x0040d780, 0);
     }
     // CoD2x end
 }
