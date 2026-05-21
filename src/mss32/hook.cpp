@@ -370,6 +370,11 @@ bool hook_patch() {
 
     // Fix MG sensitivity
     patch_byte(0x0040867d, 0xeb); // 7416 je 0x408695 => EB16 jmp 0x408695
+
+
+
+    // Allow scanning 32 LAN servers instead of 4
+    patch_byte(0x00411bce + 2, 32); // 83fe04 -> 83fe20  -  originally 4 (28960 to 28963), now 32 (28960 to 28991)
     
 
 
