@@ -192,6 +192,7 @@ void debug_createWindow(HINSTANCE hInstance) {
 
 // This thread creates and runs the debug window's message loop.
 DWORD WINAPI debug_windowThread(LPVOID lpParam) {
+    thread_setName(GetCurrentThread(), L"CoD2x DebugWindow");
     HINSTANCE hInstance = GetModuleHandle(NULL);
     debug_createWindow(hInstance);
 
