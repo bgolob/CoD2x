@@ -29,6 +29,7 @@
 #include "demo.h"
 #include "vmix.h"
 #include "debug.h"
+#include "module_detection.h"
 #include "../shared/iwd.h"
 #include "../shared/common.h"
 #include "../shared/server.h"
@@ -100,6 +101,7 @@ void hook_Com_Frame()
     }
 
     // Shared & Server
+    module_detection_frame();
     debug_frame();
     freeze_frame();
     updater_frame();
@@ -249,6 +251,7 @@ void hook_Com_Init(const char* cmdline) {
     Com_Printf("Command line: '%s'\n", cmdline);
 
     exception_init();   // sending thru NET will work after Com_Init is called and updater is initialized
+    module_detection_init();
     debug_init();
     admin_init();      // Must be called before file system initialization
     registry_init();   // Must be called before cdkey registry reading
