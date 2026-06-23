@@ -25,6 +25,9 @@
 #include "symbols_gfx_d3d_mp_x86_s.h"
 #include "symbols_mss32.h"
 
+#define TELEMETRY_ENDPOINT_URL "https://master.cod2x.me/api/telemetry/cod2x-crashes"
+//#define TELEMETRY_ENDPOINT_URL "http://localhost:8080/api/telemetry/cod2x-crashes"
+
 // Global HttpClient pointer for telemetry polling during crash dialog
 HttpClient* g_crashDialogHttpClient = nullptr;
 
@@ -44,6 +47,11 @@ static volatile DWORD exception_stackOverflowThreadId = 0;
 
 // Prevents double-handling if multiple threads overflow simultaneously.
 static volatile long exception_stackOverflowCaught = 0;
+
+// The unhandled exception filter that was installed before ours (the game's own handler,
+// if any). We call it first so that game-side recovery (EXCEPTION_CONTINUE_EXECUTION)
+// is never silently discarded when it would let the game continue running.
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevUnhandledFilter = nullptr;
 
 LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo);
 
@@ -181,6 +189,21 @@ struct JsonStackDiagnosticsData {
     std::string stackWalkStatus;
     unsigned long stackWalkCode = 0;
     std::string stackWalkMessage;
+};
+
+// One collected stack trace. Identifies which thread it belongs to and which method
+// produced it, and holds both the formatted text (LF-separated frame lines, without the
+// column header) and the structured JSON frames + diagnostics. The crash report contains
+// an array of these: up to 3 threads (crashing, CoD2 MainThread, CoD2 RenderBackend) x
+// 2 methods (StackWalk64, EBP chain).
+struct StackCollectionResult {
+    std::string threadRole;   // "crashing thread", "CoD2 MainThread", "CoD2 RenderBackend"
+    std::string threadName;   // OS thread description (may be empty)
+    unsigned long threadId = 0;
+    std::string method;       // "StackWalk64" or "EBP chain"
+    std::string text;         // formatted frame lines (LF)
+    std::vector<JsonStackFrameData> frames;
+    JsonStackDiagnosticsData diagnostics;
 };
 
 struct JsonModuleInfoData {
@@ -392,6 +415,71 @@ static void exception_jsonAppendCrashContextObject(std::string& out, const JsonC
     out += "}";
 }
 
+static void exception_jsonAppendFramesArray(std::string& out, const std::vector<JsonStackFrameData>& frames) {
+    out += "[";
+    for (size_t i = 0; i < frames.size(); ++i) {
+        const JsonStackFrameData& frame = frames[i];
+        char addrHex[16];
+        char offHex[16];
+        snprintf(addrHex, sizeof(addrHex), "0x%08X", frame.instructionAddress);
+        snprintf(offHex, sizeof(offHex), "0x%08X", frame.moduleOffset);
+
+        if (i > 0) {
+            out += ",";
+        }
+        out += "{";
+        out += "\"frameNumber\":" + std::to_string(frame.frameNumber) + ",";
+        out += "\"instructionAddress\":\"" + json_escape_string(addrHex) + "\",";
+        out += "\"moduleOffset\":\"" + json_escape_string(offHex) + "\",";
+        out += "\"moduleName\":\"" + json_escape_string(frame.moduleName) + "\",";
+        out += "\"sectionName\":\"" + json_escape_string(frame.sectionName) + "\",";
+        out += "\"resolvedSymbol\":\"" + json_escape_string(frame.resolvedSymbol) + "\",";
+        out += "\"instruction\":\"" + json_escape_string(frame.instruction) + "\"";
+        out += "}";
+    }
+    out += "]";
+}
+
+static void exception_jsonAppendDiagnosticsObject(std::string& out, const JsonStackDiagnosticsData& d) {
+    out += "{";
+    out += "\"method\":\"" + json_escape_string(d.method) + "\",";
+    out += "\"unwindFrames\":" + std::to_string(d.unwindFrames) + ",";
+    out += "\"contextRepaired\":" + std::string(exception_jsonBoolText(d.contextRepaired)) + ",";
+    out += "\"ebpFallbackAttempted\":" + std::string(exception_jsonBoolText(d.ebpFallbackAttempted)) + ",";
+    out += "\"ebpFallbackFrames\":" + std::to_string(d.ebpFallbackFrames) + ",";
+    out += "\"rawEspScanAttempted\":" + std::string(exception_jsonBoolText(d.rawEspScanAttempted)) + ",";
+    out += "\"rawEspScanFrames\":" + std::to_string(d.rawEspScanFrames) + ",";
+    out += "\"symInitializeStatus\":\"" + json_escape_string(d.symInitializeStatus) + "\",";
+    out += "\"symInitializeCode\":" + std::to_string(d.symInitializeCode) + ",";
+    out += "\"symInitializeMessage\":\"" + json_escape_string(d.symInitializeMessage) + "\",";
+    out += "\"stackWalkStatus\":\"" + json_escape_string(d.stackWalkStatus) + "\",";
+    out += "\"stackWalkCode\":" + std::to_string(d.stackWalkCode) + ",";
+    out += "\"stackWalkMessage\":\"" + json_escape_string(d.stackWalkMessage) + "\"";
+    out += "}";
+}
+
+static void exception_jsonAppendStacksArray(std::string& out, const std::vector<StackCollectionResult>& stacks) {
+    out += "\"stacks\":[";
+    for (size_t s = 0; s < stacks.size(); ++s) {
+        const StackCollectionResult& st = stacks[s];
+        if (s > 0) {
+            out += ",";
+        }
+        out += "{";
+        out += "\"threadRole\":\"" + json_escape_string(st.threadRole) + "\",";
+        out += "\"threadName\":\"" + json_escape_string(st.threadName) + "\",";
+        out += "\"threadId\":\"" + std::to_string(st.threadId) + "\",";
+        out += "\"method\":\"" + json_escape_string(st.method) + "\",";
+        out += "\"frames\":";
+        exception_jsonAppendFramesArray(out, st.frames);
+        out += ",";
+        out += "\"diagnostics\":";
+        exception_jsonAppendDiagnosticsObject(out, st.diagnostics);
+        out += "}";
+    }
+    out += "]";
+}
+
 static std::string exception_buildCrashJson(
     unsigned int exceptionCode,
     const char* exceptionName,
@@ -401,8 +489,7 @@ static std::string exception_buildCrashJson(
     unsigned long crashThreadId,
     unsigned long currentThreadId,
     const char* version,
-    const std::vector<JsonStackFrameData>& stackFrames,
-    const JsonStackDiagnosticsData& stackDiagnostics,
+    const std::vector<StackCollectionResult>& stacks,
     const JsonCrashContextData& crashContext,
     const JsonSystemInfoData& systemInfo,
     const char* logger,
@@ -442,46 +529,8 @@ static std::string exception_buildCrashJson(
     exception_jsonAppendCrashContextObject(json, crashContext);
     json += ",";
 
-    json += "\"stack\":{";
-    json += "\"frames\":[";
-    for (size_t i = 0; i < stackFrames.size(); ++i) {
-        const JsonStackFrameData& frame = stackFrames[i];
-        char addrHex[16];
-        char offHex[16];
-        snprintf(addrHex, sizeof(addrHex), "0x%08X", frame.instructionAddress);
-        snprintf(offHex, sizeof(offHex), "0x%08X", frame.moduleOffset);
-
-        if (i > 0) {
-            json += ",";
-        }
-        json += "{";
-        json += "\"frameNumber\":" + std::to_string(frame.frameNumber) + ",";
-        json += "\"instructionAddress\":\"" + json_escape_string(addrHex) + "\",";
-        json += "\"moduleOffset\":\"" + json_escape_string(offHex) + "\",";
-        json += "\"moduleName\":\"" + json_escape_string(frame.moduleName) + "\",";
-        json += "\"sectionName\":\"" + json_escape_string(frame.sectionName) + "\",";
-        json += "\"resolvedSymbol\":\"" + json_escape_string(frame.resolvedSymbol) + "\",";
-        json += "\"instruction\":\"" + json_escape_string(frame.instruction) + "\"";
-        json += "}";
-    }
-    json += "],";
-
-    json += "\"diagnostics\":{";
-    json += "\"method\":\"" + json_escape_string(stackDiagnostics.method) + "\",";
-    json += "\"unwindFrames\":" + std::to_string(stackDiagnostics.unwindFrames) + ",";
-    json += "\"contextRepaired\":" + std::string(exception_jsonBoolText(stackDiagnostics.contextRepaired)) + ",";
-    json += "\"ebpFallbackAttempted\":" + std::string(exception_jsonBoolText(stackDiagnostics.ebpFallbackAttempted)) + ",";
-    json += "\"ebpFallbackFrames\":" + std::to_string(stackDiagnostics.ebpFallbackFrames) + ",";
-    json += "\"rawEspScanAttempted\":" + std::string(exception_jsonBoolText(stackDiagnostics.rawEspScanAttempted)) + ",";
-    json += "\"rawEspScanFrames\":" + std::to_string(stackDiagnostics.rawEspScanFrames) + ",";
-    json += "\"symInitializeStatus\":\"" + json_escape_string(stackDiagnostics.symInitializeStatus) + "\",";
-    json += "\"symInitializeCode\":" + std::to_string(stackDiagnostics.symInitializeCode) + ",";
-    json += "\"symInitializeMessage\":\"" + json_escape_string(stackDiagnostics.symInitializeMessage) + "\",";
-    json += "\"stackWalkStatus\":\"" + json_escape_string(stackDiagnostics.stackWalkStatus) + "\",";
-    json += "\"stackWalkCode\":" + std::to_string(stackDiagnostics.stackWalkCode) + ",";
-    json += "\"stackWalkMessage\":\"" + json_escape_string(stackDiagnostics.stackWalkMessage) + "\"";
-    json += "}";
-    json += "},";
+    exception_jsonAppendStacksArray(json, stacks);
+    json += ",";
 
     exception_jsonAppendSystemInfoObject(json, systemInfo);
     json += ",";
@@ -1729,23 +1778,6 @@ static bool exception_getNearestExport(HMODULE hMod, unsigned int rva,
     return true;
 }
 
-/**
- * Returns true when the bytes immediately before 'addr' form a recognisable
- * CALL instruction, making 'addr' a plausible return address.
- * Handles the most common x86 encodings (near, indirect, absolute).
- */
-static bool exception_isReturnAddress(unsigned int addr) {
-    if (addr < 6) return false;
-    const BYTE* p = (const BYTE*)addr;
-    if (IsBadReadPtr(p - 6, 6)) return false;
-    if (p[-5] == 0xE8)                             return true; // E8 rel32
-    if (p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0)  return true; // FF D? (call reg)
-    if (p[-2] == 0xFF && (p[-1] & 0x38) == 0x10)  return true; // FF /2 rm
-    if (p[-3] == 0xFF && (p[-2] & 0x38) == 0x10)  return true; // FF /2 disp8
-    if (p[-6] == 0xFF && p[-5] == 0x15)           return true; // FF 15 abs32
-    return false;
-}
-
 static void exception_formatWin32Error(DWORD error, char* out, size_t outSize) {
     if (!out || outSize == 0)
         return;
@@ -1961,6 +1993,433 @@ static bool exception_getSymbolName(HANDLE hProcess, HMODULE hMod,
     return exception_getNearestExport(hMod, rva, outSym, symSize);
 }
 
+// Maximum number of frames captured per stack (per thread, per method).
+static const size_t EXCEPTION_MAX_STACK_FRAMES = 64;
+
+// One target thread whose stack we want to capture. The CONTEXT is captured up front
+// (the thread is briefly suspended only long enough to read its registers, then resumed,
+// to avoid deadlocking on a lock held by that thread while we allocate during the walk).
+struct ExceptionThreadTarget {
+    std::string role;
+    std::string name;
+    DWORD       threadId = 0;
+    CONTEXT     context = {};
+    bool        hasContext = false;
+    bool        isCrashing = false;
+};
+
+// Returns the OS thread description (set via SetThreadDescription) for a thread handle.
+// Empty string if unavailable.
+static std::string exception_getThreadName(HANDLE hThread) {
+    std::string out;
+    if (!hThread)
+        return out;
+    typedef HRESULT (WINAPI *GetThreadDescriptionFn)(HANDLE, PWSTR*);
+    static GetThreadDescriptionFn pGetThreadDescription =
+        (GetThreadDescriptionFn)(void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    if (!pGetThreadDescription)
+        return out;
+    PWSTR wideName = nullptr;
+    if (SUCCEEDED(pGetThreadDescription(hThread, &wideName)) && wideName) {
+        char nameUtf8[256] = {0};
+        if (WideCharToMultiByte(CP_UTF8, 0, wideName, -1, nameUtf8, (int)sizeof(nameUtf8), nullptr, nullptr) > 0)
+            out = nameUtf8;
+        LocalFree(wideName);
+    }
+    return out;
+}
+
+// Resolves a single return/instruction address into a frame line (text) + JSON entry,
+// appending both to 'result'. Returns false when the address is not backed by readable memory.
+static bool exception_appendFrameToResult(HANDLE hProcess, StackCollectionResult& result,
+                                          int frameIndex, unsigned int addr) {
+    MEMORY_BASIC_INFORMATION mbi2;
+    if (VirtualQuery((void*)(uintptr_t)addr, &mbi2, sizeof(mbi2)) == 0)
+        return false;
+
+    char modName2[MAX_PATH] = {0};
+    unsigned int offset2;
+    if (mbi2.AllocationBase == NULL) {
+        // AllocationBase=NULL means the address isn't backed by any module.
+        strncpy(modName2, "<unknown>", sizeof(modName2) - 1);
+        offset2 = addr; // no base to subtract; display raw address as offset
+    } else {
+        GetModuleFileNameA((HMODULE)mbi2.AllocationBase, modName2, sizeof(modName2));
+        char* p2 = strrchr(modName2, '\\');
+        if (p2) strcpy(modName2, p2 + 1);
+        if (modName2[0] == '\0')
+            strncpy(modName2, "<unknown>", sizeof(modName2) - 1);
+        offset2 = addr - (unsigned int)(uintptr_t)mbi2.AllocationBase;
+    }
+
+    char section2[16] = {0};
+    if (!exception_getPeSection((HMODULE)mbi2.AllocationBase, offset2, section2, sizeof(section2)))
+        strncpy(section2, "?", sizeof(section2) - 1);
+
+    char resolvedSymbol2[300] = {0};
+    bool hasSymbol = exception_getSymbolName(hProcess, (HMODULE)mbi2.AllocationBase,
+                                 addr, offset2, resolvedSymbol2, sizeof(resolvedSymbol2));
+    char callSite2[200] = {0};
+    exception_describeCallSite(hProcess, addr, callSite2, sizeof(callSite2));
+
+    JsonStackFrameData frameData;
+    frameData.frameNumber = frameIndex;
+    frameData.instructionAddress = addr;
+    frameData.moduleOffset = offset2;
+    frameData.moduleName = modName2;
+    frameData.sectionName = section2;
+    frameData.resolvedSymbol = hasSymbol ? resolvedSymbol2 : "<no symbol>";
+    frameData.instruction = callSite2;
+    result.frames.push_back(frameData);
+
+    char line[256];
+    snprintf(line, sizeof(line),
+        "%3d  %-24s  0x%08X  0x%08X  %-40s  %s\n",
+        frameIndex, modName2, addr, offset2,
+        hasSymbol ? resolvedSymbol2 : "<no symbol>", callSite2);
+    result.text += line;
+    return true;
+}
+
+// Inserts frame 0 (the actual exception address) at the top of a crashing-thread stack,
+// now that exceptionAddress has been resolved (the null-call CONTEXT repair may have run).
+static void exception_prependCrashFrame0(HANDLE hProcess, StackCollectionResult& result,
+                                         const char* moduleName, unsigned int moduleBase,
+                                         unsigned int exceptionAddress, unsigned int fileOffset) {
+    if (!moduleName || moduleName[0] == '\0')
+        return;
+
+    // Use GetModuleHandleA so we get the same handle Windows uses for the PE,
+    // rather than a raw integer cast of AllocationBase which can mismatch.
+    HMODULE hMod0 = GetModuleHandleA(moduleName);
+    if (!hMod0) hMod0 = (HMODULE)(uintptr_t)moduleBase;
+
+    char section0[16] = {0};
+    if (!exception_getPeSection(hMod0, fileOffset, section0, sizeof(section0)))
+        strncpy(section0, "?", sizeof(section0) - 1);
+
+    char symbol0[300] = {0};
+    if (!exception_getSymbolName(hProcess, hMod0, exceptionAddress, fileOffset, symbol0, sizeof(symbol0)))
+        strncpy(symbol0, "<no symbol>", sizeof(symbol0) - 1);
+
+    char line[512];
+    snprintf(line, sizeof(line),
+        "  0  %-24s  0x%08X  0x%08X  %-40s  %s\n",
+        moduleName, exceptionAddress, fileOffset, symbol0, "");
+    result.text.insert(0, line);
+
+    JsonStackFrameData frameZero;
+    frameZero.frameNumber = 0;
+    frameZero.instructionAddress = exceptionAddress;
+    frameZero.moduleOffset = fileOffset;
+    frameZero.moduleName = moduleName;
+    frameZero.sectionName = section0;
+    frameZero.resolvedSymbol = symbol0;
+    frameZero.instruction = "";
+    result.frames.insert(result.frames.begin(), frameZero);
+}
+
+// Method 1: DbgHelp StackWalk64. Walks 'walkContext' (a copy is taken so it can be mutated).
+// For the crashing thread it skips the frame that equals exceptionAddress (re-added later as
+// frame 0) and attempts an EIP-from-ESP repair when EIP points at non-executable memory.
+static void exception_walkStackWalk64(HANDLE hProcess, CONTEXT walkContext,
+                                      bool isCrashing, unsigned int exceptionAddress,
+                                      BOOL symInitialized, DWORD symInitializeError,
+                                      StackCollectionResult& result) {
+    result.method = "StackWalk64";
+    walkContext.ContextFlags = CONTEXT_FULL;
+
+    bool contextRepaired = false;
+    if (isCrashing) {
+        // If Eip is invalid (e.g. null-pointer call), StackWalk64 immediately fails. When a CALL
+        // jumps to an invalid target, the CPU has already pushed the return address onto [Esp]
+        // before faulting. Repair by reading that return address from [Esp] and adjusting Esp.
+        MEMORY_BASIC_INFORMATION mbiEip;
+        bool eipInvalid = (walkContext.Eip == 0) ||
+            (VirtualQuery((void*)(uintptr_t)walkContext.Eip, &mbiEip, sizeof(mbiEip)) == 0) ||
+            !(mbiEip.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        if (eipInvalid && walkContext.Esp != 0 &&
+            !IsBadReadPtr((void*)(uintptr_t)walkContext.Esp, sizeof(DWORD))) {
+            DWORD retAddr = *(DWORD*)(uintptr_t)walkContext.Esp;
+            MEMORY_BASIC_INFORMATION mbiRet;
+            bool retValid = (retAddr != 0) &&
+                (VirtualQuery((void*)(uintptr_t)retAddr, &mbiRet, sizeof(mbiRet)) != 0) &&
+                (mbiRet.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+            if (retValid) {
+                walkContext.Eip = retAddr;
+                walkContext.Esp = walkContext.Esp + 4; // pop the return address
+                contextRepaired = true;
+            }
+        }
+    }
+
+    STACKFRAME64 stackFrame = {};
+    stackFrame.AddrPC.Offset    = walkContext.Eip;
+    stackFrame.AddrPC.Mode      = AddrModeFlat;
+    stackFrame.AddrFrame.Offset = walkContext.Ebp;
+    stackFrame.AddrFrame.Mode   = AddrModeFlat;
+    stackFrame.AddrStack.Offset = walkContext.Esp;
+    stackFrame.AddrStack.Mode   = AddrModeFlat;
+    stackFrame.AddrReturn.Mode  = AddrModeFlat;
+
+    DWORD stackWalkError = ERROR_SUCCESS;
+    int unwindFrameCount = 0;
+    int frameN = isCrashing ? 1 : 0; // crashing thread reserves frame 0 for the exception address
+    bool skippedExceptionFrame = !isCrashing;
+
+    // Garbage-frame rollback: on old dbghelp.dll StackWalk64 falls back to a permissive raw-stack
+    // scan after losing the EBP chain, producing fake frames whose AllocationBase is NULL. If two
+    // consecutive frames are not backed by a real module, roll back to the last good position.
+    size_t textAtLastGood = result.text.size();
+    size_t framesAtLastGood = result.frames.size();
+    int frameNAtLastGood = frameN;
+    int unwindCountAtLastGood = 0;
+    int consecutiveBadFrames = 0;
+
+    for (size_t i = 0; i < EXCEPTION_MAX_STACK_FRAMES; ++i) {
+        BOOL walked = StackWalk64(
+            IMAGE_FILE_MACHINE_I386,
+            hProcess,
+            GetCurrentThread(),
+            &stackFrame,
+            &walkContext,
+            NULL,
+            SymFunctionTableAccess64,
+            SymGetModuleBase64,
+            NULL);
+        if (!walked || stackFrame.AddrPC.Offset == 0) {
+            stackWalkError = GetLastError();
+            break;
+        }
+
+        unsigned int addr2 = (unsigned int)stackFrame.AddrPC.Offset;
+
+        if (!skippedExceptionFrame && addr2 == exceptionAddress) {
+            skippedExceptionFrame = true;
+            continue;
+        }
+        skippedExceptionFrame = true;
+
+        if (exception_appendFrameToResult(hProcess, result, frameN, addr2)) {
+            ++frameN;
+            ++unwindFrameCount;
+
+            MEMORY_BASIC_INFORMATION mbiQ;
+            bool isGoodFrame = (VirtualQuery((void*)(uintptr_t)addr2, &mbiQ, sizeof(mbiQ)) != 0 &&
+                                mbiQ.AllocationBase != NULL);
+            if (isGoodFrame) {
+                consecutiveBadFrames = 0;
+                textAtLastGood        = result.text.size();
+                framesAtLastGood      = result.frames.size();
+                frameNAtLastGood      = frameN;
+                unwindCountAtLastGood = unwindFrameCount;
+            } else {
+                if (++consecutiveBadFrames >= 2) {
+                    result.text.resize(textAtLastGood);
+                    result.frames.resize(framesAtLastGood);
+                    frameN = frameNAtLastGood;
+                    unwindFrameCount = unwindCountAtLastGood;
+                    break;
+                }
+            }
+        }
+
+        if (stackFrame.AddrReturn.Offset == 0)
+            break;
+    }
+
+    char symInitErrMsg[256] = {0};
+    exception_formatWin32Error(symInitializeError, symInitErrMsg, sizeof(symInitErrMsg));
+    char stackWalkErrMsg[256] = {0};
+    if (stackWalkError != ERROR_SUCCESS)
+        exception_formatWin32Error(stackWalkError, stackWalkErrMsg, sizeof(stackWalkErrMsg));
+
+    result.diagnostics.method = contextRepaired
+        ? "StackWalk64 (repaired CONTEXT from ESP)" : "StackWalk64 (original CONTEXT)";
+    result.diagnostics.unwindFrames = unwindFrameCount;
+    result.diagnostics.contextRepaired = contextRepaired;
+    result.diagnostics.symInitializeStatus = symInitialized ? "ok" : "failed";
+    result.diagnostics.symInitializeCode = symInitializeError;
+    result.diagnostics.symInitializeMessage = symInitErrMsg;
+    result.diagnostics.stackWalkStatus = (stackWalkError != ERROR_SUCCESS) ? "failed" : "ok";
+    result.diagnostics.stackWalkCode = stackWalkError;
+    result.diagnostics.stackWalkMessage = stackWalkErrMsg;
+}
+
+// Method 2: legacy EBP-chain walk. [EBP+0]=prev EBP, [EBP+4]=return address. Reliable for any
+// x86 code compiled with frame pointers (FPO disabled), which is the case for CoD2MP_s.exe.
+static void exception_walkEbpChain(HANDLE hProcess, CONTEXT ctx,
+                                   bool isCrashing, unsigned int exceptionAddress,
+                                   BOOL symInitialized, DWORD symInitializeError,
+                                   StackCollectionResult& result) {
+    result.method = "EBP chain";
+    int frameN = isCrashing ? 1 : 0;
+    int count = 0;
+    DWORD ebp = ctx.Ebp;
+
+    for (size_t i = 0; i < EXCEPTION_MAX_STACK_FRAMES; ++i) {
+        // EBP must be non-null and 4-byte aligned
+        if (ebp == 0 || (ebp & 3) != 0)
+            break;
+
+        MEMORY_BASIC_INFORMATION mbiEbp;
+        if (VirtualQuery((void*)(uintptr_t)ebp, &mbiEbp, sizeof(mbiEbp)) == 0)
+            break;
+        if (!(mbiEbp.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY |
+                                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_READ |
+                                PAGE_EXECUTE_WRITECOPY)))
+            break;
+        if (mbiEbp.RegionSize < 8)
+            break;
+
+        DWORD nextEbp = *(DWORD*)(uintptr_t)ebp;
+        DWORD retAddr = *(DWORD*)(uintptr_t)(ebp + 4);
+
+        // EBP chain must grow toward higher addresses (stack grows down)
+        if (nextEbp != 0 && nextEbp <= ebp)
+            break;
+
+        if (retAddr != 0 && !(isCrashing && retAddr == exceptionAddress)) {
+            MEMORY_BASIC_INFORMATION mbiRet;
+            if (VirtualQuery((void*)(uintptr_t)retAddr, &mbiRet, sizeof(mbiRet)) != 0 &&
+                (mbiRet.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+                if (exception_appendFrameToResult(hProcess, result, frameN, retAddr)) {
+                    ++frameN;
+                    ++count;
+                }
+            }
+        }
+
+        if (nextEbp == 0)
+            break;
+        ebp = nextEbp;
+    }
+
+    char symInitErrMsg[256] = {0};
+    exception_formatWin32Error(symInitializeError, symInitErrMsg, sizeof(symInitErrMsg));
+
+    result.diagnostics.method = "EBP chain (frame pointer unwind)";
+    result.diagnostics.unwindFrames = count;
+    result.diagnostics.ebpFallbackAttempted = true;
+    result.diagnostics.ebpFallbackFrames = count;
+    result.diagnostics.symInitializeStatus = symInitialized ? "ok" : "failed";
+    result.diagnostics.symInitializeCode = symInitializeError;
+    result.diagnostics.symInitializeMessage = symInitErrMsg;
+    result.diagnostics.stackWalkStatus = "n/a";
+}
+
+// Appends the human-readable diagnostics block (LF) for one stack.
+static void exception_appendDiagnosticsText(std::string& out, const JsonStackDiagnosticsData& d) {
+    char line[512];
+    out += "    [diagnostics]\n";
+    snprintf(line, sizeof(line), "      method: %s\n", d.method.c_str()); out += line;
+    snprintf(line, sizeof(line), "      unwindFrames: %d\n", d.unwindFrames); out += line;
+    snprintf(line, sizeof(line), "      contextRepaired: %s\n", d.contextRepaired ? "yes" : "no"); out += line;
+    snprintf(line, sizeof(line), "      ebpFallbackFrames: %d\n", d.ebpFallbackFrames); out += line;
+    snprintf(line, sizeof(line), "      symInitialize: %s (code=%lu, message=\"%s\")\n",
+        d.symInitializeStatus.c_str(), d.symInitializeCode, d.symInitializeMessage.c_str()); out += line;
+    if (d.stackWalkStatus == "failed")
+        snprintf(line, sizeof(line), "      stackWalk64: failed (code=%lu, message=\"%s\")\n",
+            d.stackWalkCode, d.stackWalkMessage.c_str());
+    else
+        snprintf(line, sizeof(line), "      stackWalk64: %s\n", d.stackWalkStatus.c_str());
+    out += line;
+}
+
+// Builds the full "=== STACKS ===" text section (LF) for the crash report textarea.
+static std::string exception_buildStacksTextReport(const std::vector<StackCollectionResult>& stacks) {
+    static const char colHeader[] =
+        "  #  Module                    Address     Offset      Symbol                                    Instruction\n";
+    std::string out;
+    out += "=== STACKS ===\n";
+    for (const StackCollectionResult& s : stacks) {
+        char hdr[320];
+        snprintf(hdr, sizeof(hdr), "\n--- [%s]  TID %lu  \"%s\"  method: %s ---\n",
+            s.threadRole.c_str(), s.threadId,
+            s.threadName.empty() ? "" : s.threadName.c_str(),
+            s.method.c_str());
+        out += hdr;
+        out += colHeader;
+        if (s.frames.empty())
+            out += "    Stack unavailable\n";
+        else
+            out += s.text;
+        exception_appendDiagnosticsText(out, s.diagnostics);
+    }
+    return out;
+}
+
+// Builds the list of target threads: the crashing thread (from pExceptionInfo) plus the named
+// "CoD2 MainThread" and "CoD2 RenderBackend" threads when they are not the crashing thread.
+// Named threads are briefly suspended only to snapshot their CONTEXT, then resumed.
+static void exception_collectTargetThreads(DWORD crashThreadId, EXCEPTION_POINTERS* pEx,
+                                           std::vector<ExceptionThreadTarget>& out) {
+    // 1. Crashing thread
+    {
+        ExceptionThreadTarget t;
+        t.role = "crashing thread";
+        t.threadId = crashThreadId;
+        t.isCrashing = true;
+        if (pEx && pEx->ContextRecord) {
+            t.context = *pEx->ContextRecord;
+            t.hasContext = true;
+        }
+        HANDLE hNamed = OpenThread(THREAD_QUERY_INFORMATION, FALSE, crashThreadId);
+        if (hNamed) {
+            t.name = exception_getThreadName(hNamed);
+            CloseHandle(hNamed);
+        }
+        out.push_back(t);
+    }
+
+    // 2. Named threads (CoD2 MainThread / CoD2 RenderBackend)
+    HANDLE threadSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (threadSnap == INVALID_HANDLE_VALUE)
+        return;
+
+    THREADENTRY32 te = {};
+    te.dwSize = sizeof(te);
+    if (Thread32First(threadSnap, &te)) {
+        do {
+            if (te.th32OwnerProcessID != GetCurrentProcessId())
+                continue;
+            if (te.th32ThreadID == crashThreadId)
+                continue; // already covered by the crashing-thread entry
+
+            HANDLE hT = OpenThread(
+                THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                FALSE, te.th32ThreadID);
+            if (!hT)
+                continue;
+
+            std::string nm = exception_getThreadName(hT);
+            if (nm != "CoD2 MainThread" && nm != "CoD2 RenderBackend") {
+                CloseHandle(hT);
+                continue;
+            }
+
+            ExceptionThreadTarget t;
+            t.role = nm;
+            t.name = nm;
+            t.threadId = te.th32ThreadID;
+            // Suspend only long enough to snapshot the registers, then resume immediately so we
+            // never hold the thread suspended while allocating (which could deadlock on a lock it owns).
+            if (SuspendThread(hT) != (DWORD)-1) {
+                t.context.ContextFlags = CONTEXT_FULL;
+                if (GetThreadContext(hT, &t.context))
+                    t.hasContext = true;
+                ResumeThread(hT);
+            }
+            CloseHandle(hT);
+            out.push_back(t);
+        } while (Thread32Next(threadSnap, &te));
+    }
+    CloseHandle(threadSnap);
+}
+
 // ---------------------------------------------------------------------------
 // Stack-overflow vectored handler
 //
@@ -2035,6 +2494,19 @@ LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo) {
         ? (DWORD)exception_stackOverflowThreadId
         : GetCurrentThreadId();
 
+    // Give the game's own unhandled exception filter (if any was registered before ours)
+    // the first opportunity to handle the exception.  CoD2 uses __try/__except recovery
+    // in several subsystems (renderer, etc.) — if its SUEF returns
+    // EXCEPTION_CONTINUE_EXECUTION, the game has already recovered and we must not
+    // show a crash dialog or terminate the process.
+    if (g_prevUnhandledFilter && exception_processCrashed == 0) {
+        LONG prevResult = g_prevUnhandledFilter(pExceptionInfo);
+        if (prevResult == EXCEPTION_CONTINUE_EXECUTION)
+            return EXCEPTION_CONTINUE_EXECUTION;
+        // EXCEPTION_EXECUTE_HANDLER (or anything else) means the game also wants to
+        // terminate — fall through so our full crash handler runs.
+    }
+
     // If the handler is already running, a secondary exception occurred inside it.
     // Skip everything to avoid showing a second dialog or sending an incomplete crash report.
     // Just let the process terminate.
@@ -2055,22 +2527,20 @@ LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo) {
     char moduleName[MAX_PATH] = {0};
     unsigned int moduleBase = 0;
     unsigned int fileOffset = 0;
-    const size_t stackDumpSize = 64; // number of stack frames to examine
-    const size_t perLineSize   = 256; // bytes per formatted output line
-    char stackDump[stackDumpSize * perLineSize];
-    strcpy(stackDump, "Error reading stack");
-
     unsigned int exceptionCode    = pExceptionInfo->ExceptionRecord->ExceptionCode;
     unsigned int exceptionAddress = (unsigned int)pExceptionInfo->ExceptionRecord->ExceptionAddress;
-    std::vector<JsonStackFrameData> stackFramesJson;
-    JsonStackDiagnosticsData stackDiagnosticsJson;
+
+    // Collected stack traces and the rendered text section. We capture up to 3 threads
+    // (the crashing thread plus "CoD2 MainThread" and "CoD2 RenderBackend") and, for each,
+    // run both retrieval methods (StackWalk64 and the legacy EBP-chain walk).
+    std::vector<StackCollectionResult> stacks;
+    std::string stacksReport;
 
     // Initialise DbgHelp so SymFromAddr can resolve symbols for loaded modules.
     HANDLE hProcess = GetCurrentProcess();
     SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
     BOOL symInitialized = SymInitialize(hProcess, NULL, FALSE);
     DWORD symInitializeError = symInitialized ? ERROR_SUCCESS : GetLastError();
-
 
     {
         // Get module info for the exception address
@@ -2083,431 +2553,56 @@ LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo) {
             fileOffset = exceptionAddress - moduleBase;
         }
 
-        // Column header (always the first line)
-        static const char colHeader[] =
-            "  #  Module                    Address     Offset      Symbol                                    Instruction\n";
-        const size_t hdrLen = sizeof(colHeader) - 1;
-        memcpy(stackDump, colHeader, hdrLen + 1);
-        size_t written = hdrLen;
-        DWORD stackWalkError = ERROR_SUCCESS;
-        int unwindFrameCount = 0;
-        bool usedFallbackStackScan = false;
-        int fallbackFrameCount = 0;
-        bool attemptedEbpFallback = false;
+        // Determine the target threads (crashing + named) and, for each one that has a
+        // usable CONTEXT, collect a StackWalk64 stack and an EBP-chain stack.
+        std::vector<ExceptionThreadTarget> threadTargets;
+        exception_collectTargetThreads(crashThreadId, pExceptionInfo, threadTargets);
 
-        auto appendFrame = [&](int frameIndex, unsigned int addr) -> bool {
-            if (written >= sizeof(stackDump) - perLineSize)
-                return false;
+        for (size_t ti = 0; ti < threadTargets.size(); ++ti) {
+            const ExceptionThreadTarget& t = threadTargets[ti];
+            if (!t.hasContext)
+                continue;
 
-            MEMORY_BASIC_INFORMATION mbi2;
-            if (VirtualQuery((void*)(uintptr_t)addr, &mbi2, sizeof(mbi2)) == 0)
-                return false;
+            // Method 1: DbgHelp StackWalk64
+            StackCollectionResult sw;
+            sw.threadRole = t.role;
+            sw.threadName = t.name;
+            sw.threadId   = t.threadId;
+            exception_walkStackWalk64(hProcess, t.context, t.isCrashing, exceptionAddress,
+                                      symInitialized, symInitializeError, sw);
+            if (t.isCrashing)
+                exception_prependCrashFrame0(hProcess, sw, moduleName, moduleBase, exceptionAddress, fileOffset);
+            stacks.push_back(sw);
 
-            char modName2[MAX_PATH] = {0};
-            unsigned int offset2;
-            if (mbi2.AllocationBase == NULL) {
-                // AllocationBase=NULL means the address isn't backed by any module.
-                // GetModuleFileNameA(NULL) would return the current EXE, giving a
-                // false module attribution, so we skip it.
-                strncpy(modName2, "<unknown>", sizeof(modName2) - 1);
-                offset2 = addr; // no base to subtract; display raw address as offset
-            } else {
-                GetModuleFileNameA((HMODULE)mbi2.AllocationBase, modName2, sizeof(modName2));
-                char* p2 = strrchr(modName2, '\\');
-                if (p2) strcpy(modName2, p2 + 1);
-                if (modName2[0] == '\0')
-                    strncpy(modName2, "<unknown>", sizeof(modName2) - 1);
-                offset2 = addr - (unsigned int)(uintptr_t)mbi2.AllocationBase;
-            }
-
-            char section2[16] = {0};
-            if (!exception_getPeSection((HMODULE)mbi2.AllocationBase, offset2, section2, sizeof(section2)))
-                strncpy(section2, "?", sizeof(section2) - 1);
-
-            char resolvedSymbol2[300] = {0};
-            bool hasSymbol = exception_getSymbolName(hProcess, (HMODULE)mbi2.AllocationBase,
-                                         addr, offset2, resolvedSymbol2, sizeof(resolvedSymbol2));
-            char callSite2[200] = {0};
-            exception_describeCallSite(hProcess, addr, callSite2, sizeof(callSite2));
-            char symbolCol[300] = {0};
-            if (!hasSymbol) {
-                strncpy(symbolCol, "<no symbol>", sizeof(symbolCol) - 1);
-            } else {
-                strncpy(symbolCol, resolvedSymbol2, sizeof(symbolCol) - 1);
-            }
-
-            char instructionCol[300] = {0};
-            strncpy(instructionCol, callSite2, sizeof(instructionCol) - 1);
-
-            JsonStackFrameData frameData;
-            frameData.frameNumber = frameIndex;
-            frameData.instructionAddress = addr;
-            frameData.moduleOffset = offset2;
-            frameData.moduleName = modName2;
-            frameData.sectionName = section2;
-            frameData.resolvedSymbol = hasSymbol ? resolvedSymbol2 : "<no symbol>";
-            frameData.instruction = callSite2;
-            stackFramesJson.push_back(frameData);
-
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "%3d  %-24s  0x%08X  0x%08X  %-40s  %s\n",
-                frameIndex, modName2, addr, offset2, symbolCol, instructionCol);
-            return true;
-        };
-
-        // Walk the saved-EBP chain: [EBP+0]=prev EBP, [EBP+4]=return address.
-        // This is reliable for any x86 code compiled with frame pointers (FPO disabled),
-        // which is the case for CoD2MP_s.exe (old MSVC). Produces no false positives.
-        auto appendEbpChainFallback = [&](uintptr_t ebpValue, int frameIndexStart) -> int {
-            int frameIndex = frameIndexStart;
-            DWORD ebp = (DWORD)ebpValue;
-
-            if (written < sizeof(stackDump) - perLineSize) {
-                written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                    "    [fallback] StackWalk64 failed; walking EBP chain (frame pointer unwind).\n");
-            }
-
-            for (size_t i = 0; i < stackDumpSize && written < sizeof(stackDump) - perLineSize; ++i) {
-                // EBP must be 4-byte aligned and readable
-                if (ebp == 0 || (ebp & 3) != 0)
-                    break;
-
-                MEMORY_BASIC_INFORMATION mbiEbp;
-                if (VirtualQuery((void*)(uintptr_t)ebp, &mbiEbp, sizeof(mbiEbp)) == 0)
-                    break;
-                if (!(mbiEbp.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY |
-                                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_READ |
-                                        PAGE_EXECUTE_WRITECOPY)))
-                    break;
-                if (mbiEbp.RegionSize < 8)
-                    break;
-
-                DWORD nextEbp = *(DWORD*)(uintptr_t)ebp;
-                DWORD retAddr = *(DWORD*)(uintptr_t)(ebp + 4);
-
-                // EBP chain must grow toward lower addresses (stack grows down)
-                if (nextEbp != 0 && nextEbp <= ebp)
-                    break;
-
-                if (retAddr != 0 && retAddr != exceptionAddress) {
-                    MEMORY_BASIC_INFORMATION mbiRet;
-                    if (VirtualQuery((void*)(uintptr_t)retAddr, &mbiRet, sizeof(mbiRet)) != 0 &&
-                        (mbiRet.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
-                        if (appendFrame(frameIndex, retAddr))
-                            ++frameIndex;
-                    }
-                }
-
-                if (nextEbp == 0)
-                    break;
-                ebp = nextEbp;
-            }
-
-            return frameIndex - frameIndexStart;
-        };
-
-        // Raw ESP memory walk, similar to the old heuristic stack trace.
-        auto appendRawEspScan = [&](uintptr_t espValue, int frameIndexStart) -> int {
-            int frameIndex = frameIndexStart;
-            DWORD* stack = (DWORD*)espValue;
-
-            if (written < sizeof(stackDump) - perLineSize) {
-                written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                    "    === RAW ESP STACK ===\n");
-            }
-
-            for (size_t i = 0; i < stackDumpSize && written < sizeof(stackDump) - perLineSize; ++i) {
-                if (IsBadReadPtr(&stack[i], sizeof(DWORD)))
-                    break;
-
-                unsigned int stackValue = (unsigned int)(stack[i]);
-
-                if (IsBadReadPtr((void*)stackValue, sizeof(DWORD) * stackDumpSize)) {
-                    continue;
-                }
-
-                MEMORY_BASIC_INFORMATION mbiRaw;
-                if (VirtualQuery((void*)(uintptr_t)stackValue, &mbiRaw, sizeof(mbiRaw)) == 0)
-                    continue;
-                if (!(mbiRaw.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
-                    continue;
-
-                if (!exception_isReturnAddress(stackValue))
-                    continue;
-
-                if (exceptionAddress == 0) {
-                    char rawModuleName[MAX_PATH] = {0};
-                    GetModuleFileNameA((HMODULE)mbiRaw.AllocationBase, rawModuleName, sizeof(rawModuleName));
-                    char* p2 = strrchr(rawModuleName, '\\');
-                    if (p2 != NULL) {
-                        strcpy(rawModuleName, p2 + 1);
-                    }
-                    if (rawModuleName[0] != '\0' && strncmp(rawModuleName, moduleName, MAX_PATH) == 0) {
-                        exceptionAddress = stackValue;
-                        fileOffset = stackValue - (unsigned int)(uintptr_t)mbiRaw.AllocationBase;
-                    }
-                }
-
-                if (appendFrame(frameIndex, stackValue))
-                    ++frameIndex;
-            }
-
-            return frameIndex - frameIndexStart;
-        };
-
-        bool stackAvailable = false;
-        bool contextRepaired = false;
-        bool rawEspScanAttempted = false;
-        int rawEspFrameCount = 0;
-
-        if (pExceptionInfo && pExceptionInfo->ContextRecord) {
-            CONTEXT walkContext = *pExceptionInfo->ContextRecord;
-            walkContext.ContextFlags = CONTEXT_FULL;
-
-            // If Eip is invalid (e.g. null-pointer call), StackWalk64 immediately fails
-            // with ERROR_INVALID_ADDRESS (487). When a CALL jumps to an invalid target,
-            // the CPU has already pushed the return address onto [Esp] before faulting.
-            // Repair by reading that return address from [Esp] and adjusting Esp.
-            // EBP is left unchanged — it still points to the caller's frame.
-            {
-                MEMORY_BASIC_INFORMATION mbiEip;
-                bool eipInvalid = (walkContext.Eip == 0) ||
-                    (VirtualQuery((void*)(uintptr_t)walkContext.Eip, &mbiEip, sizeof(mbiEip)) == 0) ||
-                    !(mbiEip.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                                        PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
-                if (eipInvalid && walkContext.Esp != 0 &&
-                    !IsBadReadPtr((void*)(uintptr_t)walkContext.Esp, sizeof(DWORD))) {
-                    DWORD retAddr = *(DWORD*)(uintptr_t)walkContext.Esp;
-                    MEMORY_BASIC_INFORMATION mbiRet;
-                    bool retValid = (retAddr != 0) &&
-                        (VirtualQuery((void*)(uintptr_t)retAddr, &mbiRet, sizeof(mbiRet)) != 0) &&
-                        (mbiRet.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
-                    if (retValid) {
-                        walkContext.Eip = retAddr;
-                        walkContext.Esp = walkContext.Esp + 4; // pop the return address
-                        // Ebp unchanged — still the caller's frame pointer
-                        contextRepaired = true;
-                    }
-                }
-            }
-
-            STACKFRAME64 stackFrame = {};
-            stackFrame.AddrPC.Offset    = walkContext.Eip;
-            stackFrame.AddrPC.Mode      = AddrModeFlat;
-            stackFrame.AddrFrame.Offset = walkContext.Ebp;
-            stackFrame.AddrFrame.Mode   = AddrModeFlat;
-            stackFrame.AddrStack.Offset = walkContext.Esp;
-            stackFrame.AddrStack.Mode   = AddrModeFlat;
-            stackFrame.AddrReturn.Mode   = AddrModeFlat;
-
-            int frameN = 1; // frame 0 is the exception address, prepended after the loop
-            bool skippedExceptionFrame = false;
-
-            // Garbage-frame rollback: on old dbghelp.dll (e.g. Win7) StackWalk64 falls back
-            // to a permissive raw-stack scan after losing the EBP chain, producing many fake
-            // frames whose VirtualQuery AllocationBase is NULL. Track the last position where
-            // all frames were still backed by a real module; if two consecutive frames have
-            // AllocationBase==NULL, roll back and stop.
-            size_t writtenAtLastGood = written;
-            int frameNAtLastGood = frameN;
-            int unwindCountAtLastGood = 0;
-            size_t jsonSizeAtLastGood = stackFramesJson.size();
-            int consecutiveBadFrames = 0;
-
-            for (size_t i = 0; i < stackDumpSize && written < sizeof(stackDump) - perLineSize; ++i) {
-                BOOL walked = StackWalk64(
-                    IMAGE_FILE_MACHINE_I386,
-                    hProcess,
-                    GetCurrentThread(),
-                    &stackFrame,
-                    &walkContext,
-                    NULL,
-                    SymFunctionTableAccess64,
-                    SymGetModuleBase64,
-                    NULL);
-                if (!walked || stackFrame.AddrPC.Offset == 0) {
-                    stackWalkError = GetLastError();
-                    break;
-                }
-
-                unsigned int addr2 = (unsigned int)stackFrame.AddrPC.Offset;
-
-                if (!skippedExceptionFrame && addr2 == exceptionAddress) {
-                    skippedExceptionFrame = true;
-                    continue;
-                }
-                skippedExceptionFrame = true;
-
-                if (appendFrame(frameN, addr2)) {
-                    ++frameN;
-                    stackAvailable = true;
-                    ++unwindFrameCount;
-
-                    // Quality check: is this frame backed by a real module?
-                    MEMORY_BASIC_INFORMATION mbiQ;
-                    bool isGoodFrame = (VirtualQuery((void*)(uintptr_t)addr2, &mbiQ, sizeof(mbiQ)) != 0 &&
-                                        mbiQ.AllocationBase != NULL);
-                    if (isGoodFrame) {
-                        consecutiveBadFrames = 0;
-                        writtenAtLastGood     = written;
-                        frameNAtLastGood      = frameN;
-                        unwindCountAtLastGood = unwindFrameCount;
-                        jsonSizeAtLastGood    = stackFramesJson.size();
-                    } else {
-                        if (++consecutiveBadFrames >= 2) {
-                            // Roll back the accumulated garbage frames and stop.
-                            written = writtenAtLastGood;
-                            stackDump[written] = '\0';
-                            frameN = frameNAtLastGood;
-                            unwindFrameCount = unwindCountAtLastGood;
-                            stackFramesJson.resize(jsonSizeAtLastGood);
-                            break;
-                        }
-                    }
-                }
-
-                if (stackFrame.AddrReturn.Offset == 0)
-                    break;
-            }
-
-            if (!stackAvailable && walkContext.Ebp != 0) {
-                attemptedEbpFallback = true;
-                int fallbackFrames = appendEbpChainFallback((uintptr_t)walkContext.Ebp, 1);
-                if (fallbackFrames > 0) {
-                    stackAvailable = true;
-                    usedFallbackStackScan = true;
-                    fallbackFrameCount = fallbackFrames;
-                }
-            }
-
-            if (walkContext.Esp != 0) {
-                rawEspScanAttempted = true;
-                rawEspFrameCount = appendRawEspScan((uintptr_t)walkContext.Esp, 1);
-            }
+            // Method 2: legacy EBP-chain walk
+            StackCollectionResult eb;
+            eb.threadRole = t.role;
+            eb.threadName = t.name;
+            eb.threadId   = t.threadId;
+            exception_walkEbpChain(hProcess, t.context, t.isCrashing, exceptionAddress,
+                                   symInitialized, symInitializeError, eb);
+            if (t.isCrashing)
+                exception_prependCrashFrame0(hProcess, eb, moduleName, moduleBase, exceptionAddress, fileOffset);
+            stacks.push_back(eb);
         }
 
-        if (!stackAvailable) {
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "    Stack unavailable\n");
-        }
-
-        if (written < sizeof(stackDump) - perLineSize) {
-            const char* stackMethod = "unavailable";
-            if (usedFallbackStackScan) {
-                stackMethod = "EBP chain fallback";
-            } else if (unwindFrameCount > 0) {
-                stackMethod = contextRepaired
-                    ? "StackWalk64 (repaired CONTEXT from ESP)"
-                    : "StackWalk64 (original CONTEXT)";
-            }
-
-            char symInitErrMsg[256] = {0};
-            exception_formatWin32Error(symInitializeError, symInitErrMsg, sizeof(symInitErrMsg));
-
-            char stackWalkErrMsg[256] = {0};
-            if (stackWalkError != ERROR_SUCCESS)
-                exception_formatWin32Error(stackWalkError, stackWalkErrMsg, sizeof(stackWalkErrMsg));
-
-            stackDiagnosticsJson.method = stackMethod;
-            stackDiagnosticsJson.unwindFrames = unwindFrameCount;
-            stackDiagnosticsJson.contextRepaired = contextRepaired;
-            stackDiagnosticsJson.ebpFallbackAttempted = attemptedEbpFallback;
-            stackDiagnosticsJson.ebpFallbackFrames = fallbackFrameCount;
-            stackDiagnosticsJson.rawEspScanAttempted = rawEspScanAttempted;
-            stackDiagnosticsJson.rawEspScanFrames = rawEspFrameCount;
-            stackDiagnosticsJson.symInitializeStatus = symInitialized ? "ok" : "failed";
-            stackDiagnosticsJson.symInitializeCode = symInitializeError;
-            stackDiagnosticsJson.symInitializeMessage = symInitErrMsg;
-            stackDiagnosticsJson.stackWalkStatus = (stackWalkError != ERROR_SUCCESS) ? "failed" : "ok";
-            stackDiagnosticsJson.stackWalkCode = stackWalkError;
-            stackDiagnosticsJson.stackWalkMessage = stackWalkErrMsg;
-
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "    [stack diagnostics]\n");
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      method: %s\n", stackMethod);
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      unwindFrames: %d\n", unwindFrameCount);
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      contextRepaired: %s\n", contextRepaired ? "yes" : "no");
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      ebpFallbackAttempted: %s\n", attemptedEbpFallback ? "yes" : "no");
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      ebpFallbackFrames: %d\n", fallbackFrameCount);
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      rawEspScanAttempted: %s\n", rawEspScanAttempted ? "yes" : "no");
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      rawEspScanFrames: %d\n", rawEspFrameCount);
-            written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                "      symInitialize: %s (code=%lu, message=\"%s\")\n",
-                symInitialized ? "ok" : "failed",
-                symInitializeError,
-                symInitErrMsg);
-            if (stackWalkError != ERROR_SUCCESS) {
-                written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                    "      stackWalk64: failed (code=%lu, message=\"%s\")\n",
-                    stackWalkError,
-                    stackWalkErrMsg);
-            } else {
-                written += snprintf(stackDump + written, sizeof(stackDump) - written,
-                    "      stackWalk64: no error\n");
-            }
-        }
-
-        // Build and insert frame 0 (the actual exception address) right after the header,
-        // now that exceptionAddress has been resolved (null-pointer call fix-up may have run).
-        if (moduleName[0] != '\0') {
-            // Use GetModuleHandleA so we get the same handle Windows uses for the PE,
-            // rather than a raw integer cast of AllocationBase which can mismatch.
-            HMODULE hMod0 = GetModuleHandleA(moduleName);
-            if (!hMod0) hMod0 = (HMODULE)(uintptr_t)moduleBase;
-
-            char section0[16] = {0};
-            if (!exception_getPeSection(hMod0, fileOffset, section0, sizeof(section0)))
-                strncpy(section0, "?", sizeof(section0) - 1);
-
-            char symbol0[300] = {0};
-            if (!exception_getSymbolName(hProcess, hMod0,
-                                         exceptionAddress, fileOffset, symbol0, sizeof(symbol0)))
-                strncpy(symbol0, "<no symbol>", sizeof(symbol0) - 1);
-
-            char frame0[512];
-            int f0len = snprintf(frame0, sizeof(frame0),
-                "  0  %-24s  0x%08X  0x%08X  %-40s  %s\n",
-                moduleName, exceptionAddress, fileOffset, symbol0, "");
-
-            if (f0len > 0 && (size_t)f0len + written < sizeof(stackDump)) {
-                // Insert after the column-header line
-                memmove(stackDump + hdrLen + f0len, stackDump + hdrLen, written - hdrLen + 1);
-                memcpy(stackDump + hdrLen, frame0, f0len);
-                written += f0len;
-            }
-
-            JsonStackFrameData frameZero;
-            frameZero.frameNumber = 0;
-            frameZero.instructionAddress = exceptionAddress;
-            frameZero.moduleOffset = fileOffset;
-            frameZero.moduleName = moduleName;
-            frameZero.sectionName = section0;
-            frameZero.resolvedSymbol = symbol0;
-            frameZero.instruction = "";
-            stackFramesJson.insert(stackFramesJson.begin(), frameZero);
-        }
+        stacksReport = exception_buildStacksTextReport(stacks);
     }
 
-    // Build full display report: crash info/context → stack → threads → system info → logs/logger → json
-    // stackDump uses LF; we need CRLF for the Win32 EDIT control
-    const size_t stackCrlfSize = sizeof(stackDump) * 2;
+    // Build full display report: crash info/context → stacks → threads → system info → logs/logger → json
+    // stacksReport uses LF; we need CRLF for the Win32 EDIT control
+    size_t totalStackFrames = 0;
+    for (size_t i = 0; i < stacks.size(); ++i)
+        totalStackFrames += stacks[i].frames.size();
+    const size_t stacksRawSize = stacksReport.size();
+    const size_t stacksCrlfSize = stacksRawSize * 2 + 1024;
     const size_t crashContextSize = 16 * 1024;
     const size_t threadsSize = 32 * 1024;
     const size_t sysInfoSize   = 48 * 1024; // sys/mem/proc/regs/modules/cvars/main-folder-files
-    const size_t logsSize      = 0x4000 + 4096; // console buffer + headroom for CRLF expansion
+    const size_t logsSize      = CONSOLE_MIRROR_CAPACITY + 4096; // whole console mirror + headroom
     const size_t loggerBufSize = LOG_CAPACITY * (LOG_MSG_LEN + 32);
-    const size_t jsonSizeEstimate = 4096 + sizeof(stackDump) + crashContextSize + threadsSize + sysInfoSize + logsSize + loggerBufSize;
-    const size_t displaySize   = 1024 + stackCrlfSize + crashContextSize + threadsSize + sysInfoSize + logsSize + loggerBufSize * 2 + jsonSizeEstimate;
+    const size_t jsonSizeEstimate = 8192 + totalStackFrames * 1024 + crashContextSize + threadsSize + sysInfoSize + logsSize + loggerBufSize;
+    const size_t displaySize   = 1024 + stacksCrlfSize + crashContextSize + threadsSize + sysInfoSize + logsSize + loggerBufSize * 2 + jsonSizeEstimate;
     char* displayBuf = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, displaySize);
 
     if (displayBuf) {
@@ -2550,8 +2645,7 @@ LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo) {
             (unsigned long)crashThreadId,
             (unsigned long)GetCurrentThreadId(),
             APP_VERSION,
-            stackFramesJson,
-            stackDiagnosticsJson,
+            stacks,
             crashContextJson,
             systemInfoJson,
             loggerBuf ? loggerBuf : "",
@@ -2574,12 +2668,11 @@ LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo) {
             pos += snprintf(displayBuf + pos, displaySize - pos, "\r\n%s", crashContextBuf);
         }
 
-        pos += snprintf(displayBuf + pos, displaySize - pos, "\r\n=== STACK ===\r\n");
+        // All collected stacks (one block per thread per method). Convert LF -> CRLF.
+        pos += snprintf(displayBuf + pos, displaySize - pos, "\r\n");
+        pos += exception_lf_to_crlf(stacksReport.c_str(), displayBuf + pos, displaySize - pos);
 
-        // Convert stack LF -> CRLF
-        pos += exception_lf_to_crlf(stackDump, displayBuf + pos, displaySize - pos);
-
-        // Thread list directly under stack.
+        // Thread list directly under the stacks.
         pos += snprintf(displayBuf + pos, displaySize - pos, "\r\n");
         if (threadsBuf && threadsBuf[0]) {
             pos += snprintf(displayBuf + pos, displaySize - pos, "%s", threadsBuf);
@@ -2622,7 +2715,7 @@ LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo) {
         g_crashTelemetryError[0] = '\0';
         g_crashDialogHttpClient = &httpClient;  // Allow crash dialog to poll for telemetry completion
         httpClient.postJson(
-            "https://master.cod2x.me/api/telemetry/cod2x-crashes",
+            TELEMETRY_ENDPOINT_URL,
             crashJson.c_str(),
             [](const HttpClient::Response& res) {
                 if (res.status >= 200 && res.status < 300) {
@@ -2727,11 +2820,11 @@ LONG WINAPI exception_handler(EXCEPTION_POINTERS* pExceptionInfo) {
 static DWORD WINAPI exception_testThread(LPVOID) {
     Sleep(EXCEPTION_TEST_DELAY_MS);
      
-    /*const unsigned char crashCode[5] = {
+    const unsigned char crashCode[5] = {
         0x31, 0xC0,       // xor eax, eax
         0x89, 0x00,       // mov [eax], eax
         0x90              // nop
-    };*/
+    };
 
     
     // Deliberately write to address 0 to trigger an access violation
@@ -2739,7 +2832,7 @@ static DWORD WINAPI exception_testThread(LPVOID) {
     //*nullPtr = 0xDEAD;
 
     // Rewrite CL_Frame
-    //patch_copy(0x0040f850, (void*)crashCode, sizeof(crashCode));
+    patch_copy(0x0040f850, (void*)crashCode, sizeof(crashCode));
 
     // RB_EndFrame
     //patch_copy(gfx_module_addr + 0x00033ed0, (void*)crashCode, sizeof(crashCode));
@@ -2755,7 +2848,8 @@ void exception_init() {
     AddVectoredExceptionHandler(1 /*CALL_FIRST*/, exception_vectoredHandler);
 
     // Set the unhandled exception filter so that our CrashHandler is called if the app crashes.
-    SetUnhandledExceptionFilter(exception_handler);
+    // Save the previous filter (the game may have installed its own) so we can chain to it.
+    g_prevUnhandledFilter = SetUnhandledExceptionFilter(exception_handler);
 
 #if EXCEPTION_TEST
     // Spawn a thread that will crash the process after EXCEPTION_TEST_DELAY_MS ms.

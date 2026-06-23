@@ -13,7 +13,7 @@
 // Crash-safe mirror of console text, independent from the EDIT control.
 // Writer uses a sequence lock so readers can take a consistent snapshot
 // without blocking (important in crash context).
-static const size_t CONSOLE_MIRROR_CAPACITY = 65536;
+// CONSOLE_MIRROR_CAPACITY is defined in console.h.
 static char g_consoleMirror[CONSOLE_MIRROR_CAPACITY];
 static size_t g_consoleMirrorLen = 0;
 static volatile LONG g_consoleMirrorSeq = 0;
@@ -69,17 +69,31 @@ static size_t console_mirror_snapshot(char* out, size_t outSize) {
 		}
 
 		size_t len = g_consoleMirrorLen;
+		size_t srcOffset = 0;
 		if (len >= outSize) {
+			// Buffer too small: keep the NEWEST bytes (drop oldest from the front) so the
+			// most recent logs are never lost and the last print is not cut mid-line.
+			srcOffset = len - (outSize - 1);
 			len = outSize - 1;
 		}
 
 		if (len > 0) {
-			memcpy(out, g_consoleMirror, len);
+			memcpy(out, g_consoleMirror + srcOffset, len);
 		}
 		out[len] = '\0';
 
 		LONG seqAfter = g_consoleMirrorSeq;
 		if (seqBefore == seqAfter && !(seqAfter & 1)) {
+			// If we dropped bytes from the front, skip the (possibly partial) first line.
+			if (srcOffset > 0) {
+				char* nl = (char*)memchr(out, '\n', len);
+				if (nl) {
+					size_t skip = (size_t)(nl - out) + 1;
+					memmove(out, out + skip, len - skip);
+					len -= skip;
+					out[len] = '\0';
+				}
+			}
 			return len;
 		}
 	}
