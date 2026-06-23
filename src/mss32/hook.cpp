@@ -95,7 +95,6 @@ void hook_Com_Frame()
 
     // Only for client
     if (dedicated->value.integer == 0) {
-        affinity_frame();
         competitive_frame();
         cgame_frame();
     }
@@ -252,6 +251,7 @@ void hook_Com_Init(const char* cmdline) {
 
     exception_init();   // sending thru NET will work after Com_Init is called and updater is initialized
     module_detection_init();
+    affinity_init();
     debug_init();
     admin_init();      // Must be called before file system initialization
     registry_init();   // Must be called before cdkey registry reading
@@ -267,7 +267,6 @@ void hook_Com_Init(const char* cmdline) {
             hook_CL_Init();
     }
 
-    affinity_init();
     common_printInfo();
 
     logger_add("Com_Init finished.");
