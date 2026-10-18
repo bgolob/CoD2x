@@ -632,6 +632,13 @@ char** Sys_ListFiles(char* extension, int32_t* numFiles, int32_t wantsubs) {
                 snprintf(reason, sizeof(reason), "original IW / localized file");
             }
 
+            // CoD2x client menus (iw_CoD2x_02) are needed only in main menu (server browser)
+            // Not loaded when connecting to server, because servers do not have this file
+            if (allowFileToBeLoaded == false && isListenServer == false && clientState < CLIENT_STATE_CONNECTING && I_strnicmp(iwIwdName, "/iw_CoD2x_02", strlen("/iw_CoD2x_02")) == 0) {
+                allowFileToBeLoaded = true;
+                snprintf(reason, sizeof(reason), "CoD2x client menus");
+            }
+
 
             // When connecting to server or replaying demo
             if (allowFileToBeLoaded == false && COD2X_WIN32 && isListenServer == false && clientState >= CLIENT_STATE_CONNECTING) {
